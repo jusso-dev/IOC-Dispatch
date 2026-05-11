@@ -1,0 +1,79 @@
+import { env } from "@/lib/env";
+import { httpFetch, redact } from "@/lib/providers/http";
+import {
+  disabled,
+  failed,
+  success,
+  unsupported,
+} from "@/lib/providers/result";
+import type {
+  ProviderSubmissionInput,
+  ProviderSubmissionResult,
+} from "@/lib/providers/types";
+
+const ID = "google_safe_browsing";
+
+export async function gsbLookup(
+  input: ProviderSubmissionInput
+): Promise<ProviderSubmissionResult> {
+  const e = env();
+  if (!e.GOOGLE_SAFE_BROWSING_ENABLED)
+    return disabled(ID, "GOOGLE_SAFE_BROWSING_ENABLED=false");
+  if (!e.GOOGLE_SAFE_BROWSING_API_KEY)
+    return disabled(ID, "Missing GOOGLE_SAFE_BROWSING_API_KEY");
+  if (input.indicator.type !== "url")
+    return unsupported(ID, "Safe Browsing accepts URL only");
+
+  if (input.mode === "dry_run") {
+    return success(ID, { message: "dry run" });
+  }
+
+  const body = JSON.stringify({
+    client: { clientId: "intelrelay", clientVersion: "0.1.0" },
+    threatInfo: {
+      threatTypes: [
+        "MALWARE",
+        "SOCIAL_ENGINEERING",
+        "UNWANTED_SOFTWARE",
+        "POTENTIALLY_HARMFUL_APPLICATION",
+      ],
+      platformTypes: ["ANY_PLATFORM"],
+      threatEntryTypes: ["URL"],
+      threatEntries: [{ url: input.indicator.normalizedValue }],
+    },
+  });
+
+  try {
+    const url = `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${encodeURIComponent(
+      e.GOOGLE_SAFE_BROWSING_API_KEY
+    )}`;
+    const res = await httpFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok) {
+      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    }
+    return success(ID, {
+      raw: data,
+      message:
+        Array.isArray(data.matches) && data.matches.length
+          ? `Match: ${data.matches.length}`
+          : "No matches",
+      redactedRequest: redact({ url, body }, []),
+    });
+  } catch (err) {
+    return failed(ID, (err as Error).message);
+  }
+}
+
+export async function gsbSubmit(): Promise<ProviderSubmissionResult> {
+  return {
+    providerId: ID,
+    status: "unsupported",
+    message:
+      "Safe Browsing is a lookup-only API. Use Google's Report Phishing form manually.",
+  };
+}

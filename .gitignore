@@ -1,0 +1,28 @@
+node_modules/
+.next/
+out/
+dist/
+build/
+
+.env
+.env.local
+.env*.local
+
+*.log
+npm-debug.log*
+.pnp.*
+
+.DS_Store
+.vscode/
+.idea/
+
+prisma/migrations/dev.db*
+playwright-report/
+playwright/.cache/
+# Playwright failure screenshots saved by the runtime (PLAYWRIGHT_SCREENSHOT_DIR).
+# README screenshots live under docs/screenshots/ and are committed.
+/screenshots/
+
+coverage/
+.vitest/
+*.tsbuildinfo

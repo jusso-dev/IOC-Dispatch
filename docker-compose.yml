@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: intelrelay-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: intelrelay
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: intelrelay-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: intelrelay-app:local
+    container_name: intelrelay-app
+    command: ["app"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/intelrelay
+      REDIS_URL: redis://redis:6379
+      APP_BASE_URL: http://localhost:3000
+      QUEUE_ENABLED: "true"
+      QUEUE_BATCH_THRESHOLD: "25"
+      # Default provider envs — leave keys empty so providers report as unconfigured.
+      URLHAUS_ENABLED: "true"
+      URLSCAN_ENABLED: "true"
+      GOOGLE_SAFE_BROWSING_ENABLED: "true"
+      GOOGLE_WEB_RISK_ENABLED: "false"
+      ABUSEIPDB_ENABLED: "true"
+      CROWDSEC_ENABLED: "true"
+      VIRUSTOTAL_ENABLED: "false"
+      VIRUSTOTAL_ALLOW_ACTIVE_URL_SCAN: "false"
+      MISP_ENABLED: "false"
+      OPENCTI_ENABLED: "false"
+      PHISHTANK_ENABLED: "false"
+      PHISHTANK_PLAYWRIGHT_ENABLED: "false"
+      MICROSOFT_DEFENDER_TI_ENABLED: "false"
+      PLAYWRIGHT_ENABLED: "false"
+      CUSTOM_WEB_FORM_ENABLED: "false"
+    env_file:
+      - path: ./.env
+        required: false
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    image: intelrelay-app:local
+    container_name: intelrelay-worker
+    command: ["worker"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/intelrelay
+      REDIS_URL: redis://redis:6379
+    env_file:
+      - path: ./.env
+        required: false
+    depends_on:
+      app: { condition: service_started }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  postgres_data:

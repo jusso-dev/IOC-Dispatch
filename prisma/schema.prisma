@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SubmissionBatch {
+  id              String   @id @default(cuid())
+  name            String?
+  notes           String?
+  tags            String[]
+  mode            String
+  status          String   @default("created")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  totalCount      Int      @default(0)
+  submittedCount  Int      @default(0)
+  failedCount     Int      @default(0)
+  skippedCount    Int      @default(0)
+
+  selectedProviders String[] @default([])
+
+  indicators      SubmissionIndicator[]
+}
+
+model SubmissionIndicator {
+  id              String   @id @default(cuid())
+  batchId         String
+  originalValue   String
+  normalizedValue String
+  type            String
+  status          String
+  warning         String?
+  createdAt       DateTime @default(now())
+
+  batch           SubmissionBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  attempts        ProviderAttempt[]
+
+  @@index([batchId])
+  @@index([type])
+  @@index([normalizedValue])
+}
+
+model ProviderAttempt {
+  id              String   @id @default(cuid())
+  indicatorId     String
+  providerId      String
+  action          String
+  transport       String
+  status          String
+
+  requestPayload  Json?
+  responsePayload Json?
+  externalId      String?
+  externalUrl     String?
+  errorMessage    String?
+  screenshotPath  String?
+
+  createdAt       DateTime @default(now())
+  completedAt     DateTime?
+
+  indicator SubmissionIndicator @relation(fields: [indicatorId], references: [id], onDelete: Cascade)
+
+  @@index([indicatorId])
+  @@index([providerId])
+  @@index([status])
+  @@index([transport])
+}

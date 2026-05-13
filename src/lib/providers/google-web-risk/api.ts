@@ -1,5 +1,10 @@
 import { env } from "@/lib/env";
-import { httpFetch } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
@@ -24,9 +29,7 @@ export async function webRiskLookup(
   if (input.indicator.type !== "url")
     return unsupported(ID, "Web Risk accepts URL only");
 
-  if (input.mode === "dry_run") {
-    return success(ID, { message: "dry run" });
-  }
+  if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
   const threatTypes = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"];
   const url =
@@ -37,12 +40,22 @@ export async function webRiskLookup(
 
   try {
     const res = await httpFetch(url);
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const decoded = await decodeResponse(res);
     if (!res.ok) {
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
     }
-    return success(ID, { raw: data });
+    const threat = (decoded.body.threat as { threatTypes?: string[] } | undefined)
+      ?.threatTypes;
+    return success(ID, {
+      raw: decoded.body,
+      message: threat?.length ? `threat: ${threat.join(",")}` : "no match",
+    });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }

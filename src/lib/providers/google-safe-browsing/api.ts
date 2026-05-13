@@ -1,5 +1,10 @@
 import { env } from "@/lib/env";
-import { httpFetch, redact } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
@@ -24,9 +29,7 @@ export async function gsbLookup(
   if (input.indicator.type !== "url")
     return unsupported(ID, "Safe Browsing accepts URL only");
 
-  if (input.mode === "dry_run") {
-    return success(ID, { message: "dry run" });
-  }
+  if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
   const body = JSON.stringify({
     client: { clientId: "intelrelay", clientVersion: "0.1.0" },
@@ -52,20 +55,24 @@ export async function gsbLookup(
       headers: { "Content-Type": "application/json" },
       body,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const decoded = await decodeResponse(res);
     if (!res.ok) {
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
     }
+    const matches = Array.isArray(decoded.body.matches)
+      ? (decoded.body.matches as unknown[])
+      : [];
     return success(ID, {
-      raw: data,
-      message:
-        Array.isArray(data.matches) && data.matches.length
-          ? `Match: ${data.matches.length}`
-          : "No matches",
-      redactedRequest: redact({ url, body }, []),
+      raw: decoded.body,
+      message: matches.length ? `match: ${matches.length}` : "no matches",
     });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 

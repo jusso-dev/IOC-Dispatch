@@ -1,31 +1,25 @@
 import type { ProviderSubmissionResult } from "./types";
 
-export function success(
-  providerId: string,
-  partial: Omit<ProviderSubmissionResult, "providerId" | "status"> = {}
-): ProviderSubmissionResult {
-  return { providerId, status: "success", ...partial };
+type Extras = Omit<ProviderSubmissionResult, "providerId" | "status">;
+
+export function success(providerId: string, extras: Extras = {}): ProviderSubmissionResult {
+  return { providerId, status: "success", ...extras };
 }
 
 export function failed(
   providerId: string,
   message: string,
-  raw?: unknown
+  raw?: unknown,
+  extras: Omit<Extras, "raw" | "message"> = {}
 ): ProviderSubmissionResult {
-  return { providerId, status: "failed", message, raw };
+  return { providerId, status: "failed", message, raw, ...extras };
 }
 
-export function disabled(
-  providerId: string,
-  reason: string
-): ProviderSubmissionResult {
+export function disabled(providerId: string, reason: string): ProviderSubmissionResult {
   return { providerId, status: "disabled", message: reason };
 }
 
-export function unsupported(
-  providerId: string,
-  reason: string
-): ProviderSubmissionResult {
+export function unsupported(providerId: string, reason: string): ProviderSubmissionResult {
   return { providerId, status: "unsupported", message: reason };
 }
 
@@ -41,9 +35,6 @@ export function rateLimited(
   };
 }
 
-export function manualRequired(
-  providerId: string,
-  reason: string
-): ProviderSubmissionResult {
+export function manualRequired(providerId: string, reason: string): ProviderSubmissionResult {
   return { providerId, status: "manual_required", message: reason };
 }

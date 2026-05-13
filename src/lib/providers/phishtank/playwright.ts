@@ -6,8 +6,12 @@ import {
   success,
   unsupported,
 } from "@/lib/providers/result";
-import type { ProviderSubmissionInput, ProviderSubmissionResult } from "@/lib/providers/types";
+import type {
+  ProviderSubmissionInput,
+  ProviderSubmissionResult,
+} from "@/lib/providers/types";
 import { runPlaywrightJob } from "@/lib/providers/playwright/browser";
+import { detectCaptcha } from "@/lib/providers/playwright/helpers";
 
 const ID = "phishtank";
 
@@ -18,8 +22,12 @@ export async function phishtankPlaywrightSubmit(
   if (!e.PLAYWRIGHT_ENABLED) return disabled(ID, "PLAYWRIGHT_ENABLED=false");
   if (!e.PHISHTANK_PLAYWRIGHT_ENABLED)
     return disabled(ID, "PHISHTANK_PLAYWRIGHT_ENABLED=false");
-  if (!e.PHISHTANK_USERNAME || !e.PHISHTANK_PASSWORD)
+
+  const username = e.PHISHTANK_USERNAME;
+  const password = e.PHISHTANK_PASSWORD;
+  if (!username || !password) {
     return disabled(ID, "Missing PHISHTANK_USERNAME/PASSWORD");
+  }
   if (input.indicator.type !== "url")
     return unsupported(ID, "PhishTank submission accepts URL only");
 
@@ -34,25 +42,20 @@ export async function phishtankPlaywrightSubmit(
         timeout: 30_000,
       });
 
-      // Detect CAPTCHA/anti-bot guard before any login attempt.
-      const captcha = await page.locator(
-        '[id*="captcha"], iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"]'
-      );
-      if (await captcha.count()) {
+      if (await detectCaptcha(page)) {
         return manualRequired(
           ID,
           "PhishTank login page presents CAPTCHA. Submit manually."
         );
       }
 
-      await page.fill('input[name="username"]', e.PHISHTANK_USERNAME);
-      await page.fill('input[name="password"]', e.PHISHTANK_PASSWORD);
+      await page.fill('input[name="username"]', username);
+      await page.fill('input[name="password"]', password);
       await Promise.all([
         page.waitForLoadState("domcontentloaded"),
         page.click('button[type="submit"], input[type="submit"]'),
       ]);
 
-      // If still on login or 2FA prompt, abort.
       if (page.url().includes("login.php")) {
         return failed(ID, "PhishTank login failed");
       }
@@ -64,7 +67,10 @@ export async function phishtankPlaywrightSubmit(
         waitUntil: "domcontentloaded",
         timeout: 30_000,
       });
-      await page.fill('textarea[name="phish_url"], input[name="phish_url"]', input.indicator.normalizedValue);
+      await page.fill(
+        'textarea[name="phish_url"], input[name="phish_url"]',
+        input.indicator.normalizedValue
+      );
       await Promise.all([
         page.waitForLoadState("domcontentloaded"),
         page.click('button[type="submit"], input[type="submit"]'),
@@ -76,7 +82,7 @@ export async function phishtankPlaywrightSubmit(
       }
       return failed(ID, "No success indicator after submission");
     } catch (err) {
-      return failed(ID, (err as Error).message);
+      return failed(ID, err instanceof Error ? err.message : String(err));
     }
   });
 }

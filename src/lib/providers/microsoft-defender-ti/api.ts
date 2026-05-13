@@ -1,8 +1,16 @@
 import { env } from "@/lib/env";
-import { httpFetch, redact } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+  RateLimitedError,
+  redact,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
+  rateLimited,
   success,
   unsupported,
 } from "@/lib/providers/result";
@@ -12,19 +20,21 @@ import type {
 } from "@/lib/providers/types";
 
 const ID = "microsoft_defender_ti";
+const TOKEN_EARLY_REFRESH_MS = 60_000;
 
 interface CachedToken {
   token: string;
   expiresAt: number;
 }
-let cachedToken: CachedToken | null = null;
 
-async function getAccessToken(): Promise<string | null> {
+let cachedToken: CachedToken | null = null;
+let inflight: Promise<string> | null = null;
+
+async function fetchAccessToken(): Promise<string> {
   const e = env();
-  if (!e.MICROSOFT_TENANT_ID || !e.MICROSOFT_CLIENT_ID || !e.MICROSOFT_CLIENT_SECRET)
-    return null;
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000)
-    return cachedToken.token;
+  if (!e.MICROSOFT_TENANT_ID || !e.MICROSOFT_CLIENT_ID || !e.MICROSOFT_CLIENT_SECRET) {
+    throw new Error("Missing Microsoft tenant/client credentials");
+  }
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
@@ -43,7 +53,8 @@ async function getAccessToken(): Promise<string | null> {
       body,
     }
   );
-  const data = (await res.json().catch(() => ({}))) as {
+  const decoded = await decodeResponse(res);
+  const data = decoded.body as {
     access_token?: string;
     expires_in?: number;
     error?: string;
@@ -51,7 +62,7 @@ async function getAccessToken(): Promise<string | null> {
   };
   if (!res.ok || !data.access_token) {
     throw new Error(
-      `MSAL token error: ${data.error_description ?? res.status}`
+      `Microsoft token endpoint returned HTTP ${res.status}: ${describeHttpError(decoded)}`
     );
   }
   cachedToken = {
@@ -61,6 +72,19 @@ async function getAccessToken(): Promise<string | null> {
   return data.access_token;
 }
 
+/** Single-flight wrapper around token acquisition so we don't stampede AAD. */
+async function getAccessToken(): Promise<string> {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + TOKEN_EARLY_REFRESH_MS) {
+    return cachedToken.token;
+  }
+  if (!inflight) {
+    inflight = fetchAccessToken().finally(() => {
+      inflight = null;
+    });
+  }
+  return inflight;
+}
+
 export async function msDefenderTiLookup(
   input: ProviderSubmissionInput
 ): Promise<ProviderSubmissionResult> {
@@ -68,37 +92,59 @@ export async function msDefenderTiLookup(
   if (!e.MICROSOFT_DEFENDER_TI_ENABLED)
     return disabled(ID, "MICROSOFT_DEFENDER_TI_ENABLED=false");
 
+  if (!e.MICROSOFT_TENANT_ID || !e.MICROSOFT_CLIENT_ID || !e.MICROSOFT_CLIENT_SECRET) {
+    return disabled(ID, "Missing Microsoft tenant/client credentials");
+  }
+
   const t = input.indicator.type;
-  if (!["url", "domain", "ipv4", "md5", "sha1", "sha256"].includes(t))
+  if (!["url", "domain", "ipv4", "md5", "sha1", "sha256"].includes(t)) {
     return unsupported(ID, `MS Defender TI cannot lookup ${t}`);
+  }
 
   if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
   try {
     const token = await getAccessToken();
-    if (!token) return disabled(ID, "Missing tenant/client credentials");
-
-    // Defender TI is available via Microsoft Graph security/threatIntelligence endpoints.
-    // Endpoints accept the indicator value; Graph normalizes.
-    const headers = {
+    const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
     };
-    const url = `https://graph.microsoft.com/beta/security/threatIntelligence/articles?$search="${encodeURIComponent(
-      input.indicator.normalizedValue
-    )}"&$top=5`;
+    const url =
+      `https://graph.microsoft.com/beta/security/threatIntelligence/articles?` +
+      `$search="${encodeURIComponent(input.indicator.normalizedValue)}"&$top=5`;
 
-    const res = await httpFetch(url, {
-      headers,
-    });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    const res = await httpFetch(url, { headers });
+    const decoded = await decodeResponse(res);
+
+    // 401 typically means the cached token has been revoked; drop it so the
+    // next call refetches.
+    if (res.status === 401) {
+      cachedToken = null;
+      return failed(
+        ID,
+        `Microsoft Graph rejected token: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
     return success(ID, {
-      raw: data,
-      redactedRequest: redact({ headers }, ["Authorization"]),
+      raw: decoded.body,
+      redactedRequest: redact({ url, headers }),
     });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    if (err instanceof RateLimitedError) return rateLimited(ID);
+    if (err instanceof HttpTimeoutError) {
+      return failed(ID, `request timed out after ${err.timeoutMs}ms`);
+    }
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }

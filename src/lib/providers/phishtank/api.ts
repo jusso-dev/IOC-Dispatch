@@ -1,5 +1,11 @@
 import { env } from "@/lib/env";
-import { httpFetch } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+  redact,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
@@ -29,20 +35,31 @@ export async function phishtankLookup(
   });
   if (e.PHISHTANK_API_KEY) body.set("app_key", e.PHISHTANK_API_KEY);
 
+  const headers: Record<string, string> = {
+    "User-Agent": "phishtank/intelrelay",
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+
   try {
     const res = await httpFetch("https://checkurl.phishtank.com/checkurl/", {
       method: "POST",
-      headers: {
-        "User-Agent": "phishtank/intelrelay",
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers,
       body,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
-    return success(ID, { raw: data });
+    const decoded = await decodeResponse(res);
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
+    return success(ID, {
+      raw: decoded.body,
+      redactedRequest: redact({ headers, body: body.toString() }),
+    });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }

@@ -1,11 +1,12 @@
 import { env } from "@/lib/env";
-import { httpFetch, redact } from "@/lib/providers/http";
 import {
-  disabled,
-  failed,
-  success,
-  unsupported,
-} from "@/lib/providers/result";
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+  redact,
+} from "@/lib/providers/http";
+import { disabled, failed, success, unsupported } from "@/lib/providers/result";
 import type {
   ProviderSubmissionInput,
   ProviderSubmissionResult,
@@ -74,7 +75,7 @@ export async function openctiSubmit(
   };
 
   const base = e.OPENCTI_BASE_URL.replace(/\/$/, "");
-  const headers = {
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${e.OPENCTI_API_KEY}`,
     "Content-Type": "application/json",
   };
@@ -84,25 +85,28 @@ export async function openctiSubmit(
       headers,
       body: JSON.stringify({ query, variables }),
     });
-    const data = (await res.json().catch(() => ({}))) as {
+    const decoded = await decodeResponse(res);
+    const data = decoded.body as {
       data?: { indicatorAdd?: { id?: string; standard_id?: string } };
-      errors?: unknown;
+      errors?: Array<{ message?: string }>;
     };
-    if (!res.ok || data.errors)
-      return failed(
-        ID,
-        `OpenCTI error: HTTP ${res.status} ${JSON.stringify(data.errors ?? {}).slice(0, 200)}`,
-        data
-      );
+    if (!res.ok || data.errors?.length) {
+      const detail = data.errors?.[0]?.message ?? describeHttpError(decoded);
+      return failed(ID, `OpenCTI HTTP ${res.status}: ${detail}`, decoded.body, {
+        redactedRequest: redact({ headers }),
+      });
+    }
     const id = data.data?.indicatorAdd?.id;
     return success(ID, {
       externalId: id,
       externalUrl: id ? `${base}/dashboard/observations/indicators/${id}` : undefined,
       raw: data,
-      redactedRequest: redact({ headers }, ["Authorization"]),
+      message: id ? `indicator ${id} created` : "submitted",
+      redactedRequest: redact({ headers }),
     });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 

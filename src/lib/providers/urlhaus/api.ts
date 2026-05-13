@@ -1,7 +1,9 @@
 import { env } from "@/lib/env";
 import {
   decodeResponse,
+  describeHttpError,
   httpFetch,
+  HttpTimeoutError,
   RateLimitedError,
   redact,
 } from "@/lib/providers/http";
@@ -23,9 +25,7 @@ const BASE = "https://urlhaus-api.abuse.ch/v1";
 function authHeaders(): Record<string, string> | null {
   const key = env().URLHAUS_AUTH_KEY;
   if (!key) return null;
-  return {
-    "Auth-Key": key,
-  };
+  return { "Auth-Key": key };
 }
 
 export async function urlhausSubmit(
@@ -40,7 +40,7 @@ export async function urlhausSubmit(
   if (!auth) {
     return disabled(
       ID,
-      "URLhaus now requires an Auth-Key for all endpoints. Set URLHAUS_AUTH_KEY (register at https://auth.abuse.ch)."
+      "URLhaus requires an Auth-Key. Set URLHAUS_AUTH_KEY (register at https://auth.abuse.ch)."
     );
   }
 
@@ -83,10 +83,13 @@ export async function urlhausSubmit(
     const decoded = await decodeResponse(res);
     const data = decoded.body;
 
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+
     const queryStatus = (data.query_status as string) ?? "";
     const submissionStatus =
-      ((data.submission as { status?: string } | undefined)?.status as string) ??
-      "";
+      ((data.submission as { status?: string } | undefined)?.status as string) ?? "";
 
     if (res.ok && (queryStatus === "ok" || submissionStatus === "ok")) {
       return success(ID, {
@@ -96,17 +99,19 @@ export async function urlhausSubmit(
             : undefined,
         message: "submitted",
         raw: data,
-        redactedRequest: redact({ headers, body: body.toString() }, ["Auth-Key"]),
+        redactedRequest: redact({ headers, body: body.toString() }),
       });
     }
     return failed(
       ID,
       `HTTP ${res.status}${queryStatus ? `: ${queryStatus}` : ""}`,
-      data
+      data,
+      { redactedRequest: redact({ headers, body: body.toString() }) }
     );
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -122,7 +127,7 @@ export async function urlhausLookup(
   if (!auth) {
     return disabled(
       ID,
-      "URLhaus now requires an Auth-Key for all endpoints. Set URLHAUS_AUTH_KEY (register at https://auth.abuse.ch)."
+      "URLhaus requires an Auth-Key. Set URLHAUS_AUTH_KEY (register at https://auth.abuse.ch)."
     );
   }
 
@@ -147,10 +152,17 @@ export async function urlhausLookup(
       perMinute: e.URLHAUS_RATE_LIMIT_PER_MINUTE,
     });
     const decoded = await decodeResponse(res);
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
     const data = decoded.body;
     const queryStatus = (data.query_status as string) ?? "";
     if (!res.ok) {
-      return failed(ID, `HTTP ${res.status}${queryStatus ? `: ${queryStatus}` : ""}`, data);
+      return failed(
+        ID,
+        `HTTP ${res.status}${queryStatus ? `: ${queryStatus}` : ""}`,
+        data
+      );
     }
     return success(ID, {
       raw: data,
@@ -158,16 +170,17 @@ export async function urlhausLookup(
         queryStatus === "ok"
           ? `listed (${(data.threat as string) ?? "url"})`
           : queryStatus === "no_results"
-          ? "not in corpus"
-          : queryStatus || "ok",
+            ? "not in corpus"
+            : queryStatus || "ok",
       externalUrl:
         typeof data.urlhaus_reference === "string"
           ? (data.urlhaus_reference as string)
           : undefined,
-      redactedRequest: redact({ headers, body: body.toString() }, ["Auth-Key"]),
+      redactedRequest: redact({ headers, body: body.toString() }),
     });
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }

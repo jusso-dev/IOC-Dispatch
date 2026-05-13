@@ -1,5 +1,12 @@
 import { env } from "@/lib/env";
-import { httpFetch, RateLimitedError, redact } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+  RateLimitedError,
+  redact,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
@@ -13,6 +20,7 @@ import type {
 } from "@/lib/providers/types";
 
 const ID = "abuseipdb";
+const BASE = "https://api.abuseipdb.com/api/v2";
 
 export async function abuseipdbLookup(
   input: ProviderSubmissionInput
@@ -26,29 +34,40 @@ export async function abuseipdbLookup(
   if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
   const url =
-    `https://api.abuseipdb.com/api/v2/check` +
+    `${BASE}/check` +
     `?ipAddress=${encodeURIComponent(input.indicator.normalizedValue)}` +
     `&maxAgeInDays=90&verbose`;
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    Key: e.ABUSEIPDB_API_KEY,
+  };
 
   try {
     const res = await httpFetch(url, {
-      headers: {
-        Accept: "application/json",
-        Key: e.ABUSEIPDB_API_KEY,
-      },
+      headers,
       rateLimitKey: ID,
       perMinute: e.ABUSEIPDB_RATE_LIMIT_PER_MINUTE,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    const decoded = await decodeResponse(res);
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
     return success(ID, {
-      raw: data,
-      message: extractConfidence(data),
+      raw: decoded.body,
+      message: extractConfidence(decoded.body),
+      redactedRequest: redact({ url, headers }),
     });
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -61,20 +80,15 @@ export async function abuseipdbReport(
   if (input.indicator.type !== "ipv4")
     return unsupported(ID, "AbuseIPDB accepts IPv4 only");
 
-  const categories =
-    (input.extra?.categories as number[]) ?? // numeric per AbuseIPDB taxonomy
-    [];
-  if (!categories.length)
+  const categories = (input.extra?.categories as number[]) ?? [];
+  if (!categories.length) {
     return failed(ID, "AbuseIPDB report requires at least one category");
-
+  }
   const comment = input.comment;
   if (!comment) return failed(ID, "AbuseIPDB report requires a comment");
 
   if (input.mode === "dry_run") {
-    return success(ID, {
-      message: "dry run",
-      raw: { categories, comment },
-    });
+    return success(ID, { message: "dry run", raw: { categories, comment } });
   }
 
   const body = new URLSearchParams({
@@ -82,31 +96,39 @@ export async function abuseipdbReport(
     categories: categories.join(","),
     comment,
   });
-
-  const headers = {
+  const headers: Record<string, string> = {
     Accept: "application/json",
     Key: e.ABUSEIPDB_API_KEY,
   };
 
   try {
-    const res = await httpFetch(`https://api.abuseipdb.com/api/v2/report`, {
+    const res = await httpFetch(`${BASE}/report`, {
       method: "POST",
       headers,
       body,
       rateLimitKey: ID,
       perMinute: e.ABUSEIPDB_RATE_LIMIT_PER_MINUTE,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    const decoded = await decodeResponse(res);
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
     return success(ID, {
-      raw: data,
-      message: extractConfidence(data),
-      redactedRequest: redact({ headers, body: body.toString() }, ["Key"]),
+      raw: decoded.body,
+      message: extractConfidence(decoded.body),
+      redactedRequest: redact({ headers, body: body.toString() }),
     });
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 

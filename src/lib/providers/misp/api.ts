@@ -1,11 +1,12 @@
 import { env } from "@/lib/env";
-import { httpFetch, redact } from "@/lib/providers/http";
+import { moduleLogger } from "@/lib/logger";
 import {
-  disabled,
-  failed,
-  success,
-  unsupported,
-} from "@/lib/providers/result";
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  redact,
+} from "@/lib/providers/http";
+import { disabled, failed, success, unsupported } from "@/lib/providers/result";
 import type {
   ProviderSubmissionInput,
   ProviderSubmissionResult,
@@ -13,6 +14,7 @@ import type {
 import type { IndicatorType } from "@/lib/indicators/types";
 
 const ID = "misp";
+const log = moduleLogger("misp");
 
 const MISP_TYPE_MAP: Record<IndicatorType, string | null> = {
   url: "url",
@@ -25,15 +27,21 @@ const MISP_TYPE_MAP: Record<IndicatorType, string | null> = {
   unknown: null,
 };
 
-function fetchOpts(tlsVerify: boolean): RequestInit {
-  // Node global fetch honors NODE_TLS_REJECT_UNAUTHORIZED env var; an Agent override
-  // is not exposed cleanly here. We surface a warning instead when verify=false.
-  if (!tlsVerify && process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0") {
-    console.warn(
-      "[misp] MISP_VERIFY_TLS=false but NODE_TLS_REJECT_UNAUTHORIZED is not 0; TLS still strict."
-    );
-  }
-  return {};
+/**
+ * MISP self-hosting often runs with a self-signed certificate. Node's global
+ * fetch can't override TLS verification per-request without swapping in a
+ * custom Undici dispatcher, which we deliberately don't ship by default — it
+ * would also affect every other outbound call. We log a warning so operators
+ * can choose to set `NODE_TLS_REJECT_UNAUTHORIZED=0` for the worker process
+ * if they really need it.
+ */
+function warnIfTlsVerifyMismatched(tlsVerify: boolean): void {
+  if (tlsVerify) return;
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") return;
+  log.warn(
+    "MISP_VERIFY_TLS=false but NODE_TLS_REJECT_UNAUTHORIZED is not 0; TLS verification remains strict. " +
+      "Set the env var on the IntelRelay process if you trust the MISP cert chain."
+  );
 }
 
 export async function mispSubmit(
@@ -45,8 +53,7 @@ export async function mispSubmit(
   if (!e.MISP_API_KEY) return disabled(ID, "Missing MISP_API_KEY");
 
   const mispType = MISP_TYPE_MAP[input.indicator.type];
-  if (!mispType)
-    return unsupported(ID, `MISP cannot store ${input.indicator.type}`);
+  if (!mispType) return unsupported(ID, `MISP cannot store ${input.indicator.type}`);
 
   if (input.mode === "dry_run") {
     return success(ID, {
@@ -54,6 +61,8 @@ export async function mispSubmit(
       raw: { mispType, value: input.indicator.normalizedValue },
     });
   }
+
+  warnIfTlsVerifyMismatched(e.MISP_VERIFY_TLS);
 
   const eventId = input.extra?.eventId as string | undefined;
   const distribution = (input.extra?.distribution as number | undefined) ?? 0;
@@ -86,16 +95,15 @@ export async function mispSubmit(
         method: "POST",
         headers,
         body: JSON.stringify(evBody),
-        ...fetchOpts(e.MISP_VERIFY_TLS),
       });
-      const evData = (await evRes.json().catch(() => ({}))) as {
-        Event?: { id?: string };
-      };
+      const evDecoded = await decodeResponse(evRes);
+      const evData = evDecoded.body as { Event?: { id?: string } };
       if (!evRes.ok || !evData?.Event?.id) {
         return failed(
           ID,
-          `MISP event/add failed: HTTP ${evRes.status}`,
-          evData
+          `MISP event/add failed: HTTP ${evRes.status} (${describeHttpError(evDecoded)})`,
+          evDecoded.body,
+          { redactedRequest: redact({ url: `${base}/events/add`, headers }) }
         );
       }
       targetEventId = evData.Event.id;
@@ -110,46 +118,42 @@ export async function mispSubmit(
         comment: input.comment ?? "",
       },
     };
-    const attrRes = await httpFetch(
-      `${base}/attributes/add/${targetEventId}`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify(attrBody),
-        ...fetchOpts(e.MISP_VERIFY_TLS),
-      }
-    );
-    const attrData = (await attrRes.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
+    const attrRes = await httpFetch(`${base}/attributes/add/${targetEventId}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(attrBody),
+    });
+    const attrDecoded = await decodeResponse(attrRes);
     if (!attrRes.ok) {
       return failed(
         ID,
-        `MISP attribute/add failed: HTTP ${attrRes.status}`,
-        attrData
+        `MISP attribute/add failed: HTTP ${attrRes.status} (${describeHttpError(attrDecoded)})`,
+        attrDecoded.body,
+        { redactedRequest: redact({ headers }) }
       );
     }
 
-    if (tags.length) {
-      for (const t of tags) {
+    for (const tag of tags) {
+      try {
         await httpFetch(`${base}/tags/attachTagToObject`, {
           method: "POST",
           headers,
-          body: JSON.stringify({ uuid: targetEventId, tag: t }),
-          ...fetchOpts(e.MISP_VERIFY_TLS),
-        }).catch(() => undefined);
+          body: JSON.stringify({ uuid: targetEventId, tag }),
+        });
+      } catch (err) {
+        log.warn("attachTagToObject failed", { tag, err });
       }
     }
 
     return success(ID, {
       externalId: targetEventId,
       externalUrl: `${base}/events/view/${targetEventId}`,
-      raw: attrData,
-      redactedRequest: redact({ headers }, ["Authorization"]),
+      raw: attrDecoded.body,
+      message: `attribute added to event ${targetEventId}`,
+      redactedRequest: redact({ headers }),
     });
   } catch (err) {
-    return failed(ID, (err as Error).message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -157,7 +161,6 @@ function defaultCategory(t: IndicatorType): string {
   switch (t) {
     case "url":
     case "domain":
-      return "Network activity";
     case "ipv4":
       return "Network activity";
     case "md5":

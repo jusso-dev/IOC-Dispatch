@@ -1,45 +1,42 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { parseIndicators } from "@/lib/indicators/parse";
-import { getEligibleProviderActions } from "@/server/submissions/routing";
-import type { SubmissionMode } from "@/lib/providers/types";
 import { env } from "@/lib/env";
+import { parseIndicators } from "@/lib/indicators/parse";
+import { readJson, withErrorHandling } from "@/lib/api/handler";
+import { getEligibleProviderActions } from "@/server/submissions/routing";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 const Body = z.object({
-  input: z.string().min(1),
-  selectedProviderIds: z.array(z.string()).default([]),
+  input: z.string().min(1).max(1_000_000),
+  selectedProviderIds: z
+    .array(z.string().min(1).max(64))
+    .max(32)
+    .default([]),
   mode: z.enum(["lookup", "submit", "dry_run"]).default("lookup"),
 });
 
-export async function POST(req: Request) {
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
-  }
-  const parsed = Body.safeParse(body);
-  if (!parsed.success)
-    return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
+export const POST = withErrorHandling("POST /api/parse", async (req: Request) => {
+  const parsed = await readJson(req, Body);
+  if (!parsed.ok) return parsed.response;
 
   const max = env().MAX_INDICATORS_PER_BATCH;
-  const indicators = parseIndicators(parsed.data.input).slice(0, max);
-  const mode = parsed.data.mode as SubmissionMode;
+  const all = parseIndicators(parsed.value.input);
+  const indicators = all.slice(0, max);
 
-  const previewRows = indicators.map((ind) => {
-    const plan = getEligibleProviderActions(ind, {
-      selectedProviderIds: parsed.data.selectedProviderIds,
-      mode,
-    });
-    return {
-      indicator: ind,
-      plan,
-    };
-  });
+  const rows = indicators.map((indicator) => ({
+    indicator,
+    plan: getEligibleProviderActions(indicator, {
+      selectedProviderIds: parsed.value.selectedProviderIds,
+      mode: parsed.value.mode,
+    }),
+  }));
 
   return NextResponse.json({
     count: indicators.length,
-    truncated: indicators.length === max,
-    rows: previewRows,
+    truncated: all.length > indicators.length,
+    truncatedCount: Math.max(0, all.length - indicators.length),
+    rows,
   });
-}
+});

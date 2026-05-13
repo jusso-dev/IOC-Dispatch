@@ -1,5 +1,12 @@
 import { env } from "@/lib/env";
-import { httpFetch, RateLimitedError, redact } from "@/lib/providers/http";
+import {
+  decodeResponse,
+  describeHttpError,
+  httpFetch,
+  HttpTimeoutError,
+  RateLimitedError,
+  redact,
+} from "@/lib/providers/http";
 import {
   disabled,
   failed,
@@ -19,8 +26,12 @@ function endpointForLookup(input: ProviderSubmissionInput): string | null {
   const v = input.indicator.normalizedValue;
   switch (input.indicator.type) {
     case "url": {
-      // VT identifies URLs by base64url(sha256-ish) — actually base64url of the URL itself, no padding.
-      const id = Buffer.from(v).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+      // VT identifies URLs by base64url of the URL itself, no padding.
+      const id = Buffer.from(v)
+        .toString("base64")
+        .replace(/=+$/, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
       return `${BASE}/urls/${id}`;
     }
     case "domain":
@@ -48,26 +59,43 @@ export async function vtLookup(
 
   if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
+  const headers: Record<string, string> = { "x-apikey": e.VIRUSTOTAL_API_KEY };
+
   try {
     const res = await httpFetch(url, {
-      headers: { "x-apikey": e.VIRUSTOTAL_API_KEY },
+      headers,
       rateLimitKey: ID,
       perMinute: e.VIRUSTOTAL_RATE_LIMIT_PER_MINUTE,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const decoded = await decodeResponse(res);
+
     if (res.status === 404) {
-      return success(ID, { message: "Not in VT corpus", raw: data });
+      return success(ID, {
+        message: "not in VT corpus",
+        raw: decoded.body,
+        redactedRequest: redact({ url, headers }),
+      });
     }
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
     return success(ID, {
-      raw: data,
-      message: vtStats(data),
+      raw: decoded.body,
+      message: vtStats(decoded.body),
       externalUrl: vtPermalink(input),
+      redactedRequest: redact({ url, headers }),
     });
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -85,7 +113,8 @@ export async function vtScan(
   if (input.mode === "dry_run") return success(ID, { message: "dry run" });
 
   const body = new URLSearchParams({ url: input.indicator.normalizedValue });
-  const headers = { "x-apikey": e.VIRUSTOTAL_API_KEY };
+  const headers: Record<string, string> = { "x-apikey": e.VIRUSTOTAL_API_KEY };
+
   try {
     const res = await httpFetch(`${BASE}/urls`, {
       method: "POST",
@@ -94,16 +123,26 @@ export async function vtScan(
       rateLimitKey: ID,
       perMinute: e.VIRUSTOTAL_RATE_LIMIT_PER_MINUTE,
     });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok)
-      return failed(ID, `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`, data);
+    const decoded = await decodeResponse(res);
+    if (res.status === 429) {
+      return rateLimited(ID, "remote", describeHttpError(decoded));
+    }
+    if (!res.ok) {
+      return failed(
+        ID,
+        `HTTP ${res.status}: ${describeHttpError(decoded)}`,
+        decoded.body
+      );
+    }
     return success(ID, {
-      raw: data,
-      redactedRequest: redact({ headers, body: body.toString() }, ["x-apikey"]),
+      raw: decoded.body,
+      message: "submitted for scan",
+      redactedRequest: redact({ headers, body: body.toString() }),
     });
   } catch (err) {
     if (err instanceof RateLimitedError) return rateLimited(ID);
-    return failed(ID, (err as Error).message);
+    if (err instanceof HttpTimeoutError) return failed(ID, err.message);
+    return failed(ID, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -126,7 +165,7 @@ function vtPermalink(input: ProviderSubmissionInput): string | undefined {
 }
 
 function vtStats(data: unknown): string | undefined {
-  const stats = (data as {
+  const attributes = (data as {
     data?: {
       attributes?: {
         last_analysis_stats?: Record<string, number>;
@@ -134,8 +173,8 @@ function vtStats(data: unknown): string | undefined {
       };
     };
   })?.data?.attributes;
-  if (!stats?.last_analysis_stats) return undefined;
-  const s = stats.last_analysis_stats;
+  if (!attributes?.last_analysis_stats) return undefined;
+  const s = attributes.last_analysis_stats;
   const total = Object.values(s).reduce((a, b) => a + b, 0);
-  return `malicious=${s.malicious ?? 0}/${total}, rep=${stats.reputation ?? "?"}`;
+  return `malicious=${s.malicious ?? 0}/${total}, rep=${attributes.reputation ?? "?"}`;
 }

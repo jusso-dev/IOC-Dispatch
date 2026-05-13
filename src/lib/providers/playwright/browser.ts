@@ -1,32 +1,41 @@
-import path from "node:path";
 import fs from "node:fs/promises";
+import path from "node:path";
+import type { Browser, Page } from "playwright";
 import { env } from "@/lib/env";
+import { moduleLogger } from "@/lib/logger";
 import { failed } from "@/lib/providers/result";
-import type {
-  ProviderSubmissionResult,
-} from "@/lib/providers/types";
+import type { ProviderSubmissionResult } from "@/lib/providers/types";
 
-type PageType = Awaited<ReturnType<typeof getBrowser>> extends infer T
-  ? T extends { newContext: (...args: never[]) => Promise<infer C> }
-    ? C extends { newPage: () => Promise<infer P> }
-      ? P
-      : never
-    : never
-  : never;
+const log = moduleLogger("playwright");
 
-let cached: { browser: unknown } | null = null;
+let cachedBrowser: Browser | null = null;
 
-async function getBrowser() {
-  if (cached) return cached.browser as Awaited<ReturnType<typeof importChromium>>;
-  const browser = await importChromium();
-  cached = { browser };
+async function launchBrowser(): Promise<Browser> {
+  // Dynamic import keeps `playwright` out of the Edge/middleware bundles.
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  browser.on("disconnected", () => {
+    log.warn("chromium disconnected; clearing cached browser");
+    if (cachedBrowser === browser) cachedBrowser = null;
+  });
   return browser;
 }
 
-async function importChromium() {
-  // Dynamic import keeps `playwright` out of the Edge/middleware bundles.
-  const { chromium } = await import("playwright");
-  return chromium.launch({ headless: true });
+async function getBrowser(): Promise<Browser> {
+  if (cachedBrowser && cachedBrowser.isConnected()) return cachedBrowser;
+  if (cachedBrowser) {
+    await cachedBrowser.close().catch(() => undefined);
+    cachedBrowser = null;
+  }
+  cachedBrowser = await launchBrowser();
+  return cachedBrowser;
+}
+
+export async function closeBrowser(): Promise<void> {
+  if (!cachedBrowser) return;
+  const b = cachedBrowser;
+  cachedBrowser = null;
+  await b.close().catch((err) => log.warn("close error", { err }));
 }
 
 /**
@@ -34,11 +43,11 @@ async function importChromium() {
  * gates (e.g. PHISHTANK_PLAYWRIGHT_ENABLED) are checked by the caller.
  *
  * Each job gets a fresh browser context so cookies, storage, and creds don't leak
- * across providers. Screenshots taken only on failure.
+ * across providers. Screenshots are only taken on failure.
  */
 export async function runPlaywrightJob(
   providerId: string,
-  fn: (page: PageType) => Promise<ProviderSubmissionResult>
+  fn: (page: Page) => Promise<ProviderSubmissionResult>
 ): Promise<ProviderSubmissionResult> {
   const e = env();
   if (!e.PLAYWRIGHT_ENABLED) {
@@ -49,11 +58,14 @@ export async function runPlaywrightJob(
     };
   }
 
-  let browser: Awaited<ReturnType<typeof importChromium>>;
+  let browser: Browser;
   try {
     browser = await getBrowser();
   } catch (err) {
-    return failed(providerId, `Failed to launch Chromium: ${(err as Error).message}`);
+    return failed(
+      providerId,
+      `Failed to launch Chromium: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   const context = await browser.newContext({
@@ -64,13 +76,14 @@ export async function runPlaywrightJob(
   const page = await context.newPage();
 
   try {
-    return await fn(page as PageType);
+    return await fn(page);
   } catch (err) {
+    log.warn("playwright job threw", { providerId, err });
     const shot = await takeFailureScreenshot(page, providerId);
     return {
       providerId,
       status: "failed",
-      message: (err as Error).message,
+      message: err instanceof Error ? err.message : String(err),
       raw: shot ? { screenshotPath: shot } : undefined,
     };
   } finally {
@@ -79,12 +92,11 @@ export async function runPlaywrightJob(
 }
 
 async function takeFailureScreenshot(
-  page: { screenshot: (opts: { path: string }) => Promise<unknown> },
+  page: Page,
   providerId: string
 ): Promise<string | null> {
-  const e = env();
   try {
-    const dir = path.resolve(e.PLAYWRIGHT_SCREENSHOT_DIR);
+    const dir = path.resolve(env().PLAYWRIGHT_SCREENSHOT_DIR);
     await fs.mkdir(dir, { recursive: true });
     const file = path.join(
       dir,
@@ -92,7 +104,8 @@ async function takeFailureScreenshot(
     );
     await page.screenshot({ path: file });
     return file;
-  } catch {
+  } catch (err) {
+    log.debug("screenshot failed", { providerId, err });
     return null;
   }
 }
